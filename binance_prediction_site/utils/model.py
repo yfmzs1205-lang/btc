@@ -1,151 +1,81 @@
 """
-Model training utilities for crypto price trend prediction.
-
-This module defines functions to build and evaluate a classifier that
-predicts whether the cryptocurrency price will decline after a given
-time horizon.  A random forest model from scikit-learn is used for
-its robustness and ease of use.  The functions return both the
-trained model and evaluation metrics.
+Model training utilities for crypto price trend classification.
 """
 from __future__ import annotations
-
-import pandas as pd
 import numpy as np
-from typing import Tuple, Dict
+import pandas as pd
+from typing import Dict, List, Tuple
 
-from sklearn.ensemble import RandomForestClassifier
+# 原来的“批量训练”随机森林留着，供离线一次性训练
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.ensemble import RandomForestClassifier
 
+# ✅ 新增：用于在线增量学习
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
+# -------------------------
+# 批量训练（保持你的原功能）
+# -------------------------
 def train_classifier(
     df: pd.DataFrame,
-    feature_cols: list[str],
+    feature_cols: List[str],
     target_col: str = "target",
-    test_size: float = 0.2,
+    test_size: float = 0.25,
     random_state: int = 42,
 ) -> Tuple[RandomForestClassifier, Dict[str, float]]:
-    """Train a random forest classifier on the provided data.
+    X = df[feature_cols].values
+    y = df[target_col].values.astype(int)
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame containing feature columns and a binary target column.
-    feature_cols : list[str]
-        Names of columns in `df` to use as model features.
-    target_col : str, optional
-        Name of the binary target column.  Defaults to 'target'.
-    test_size : float, optional
-        Fraction of data to reserve for validation.  Defaults to 0.2.
-    random_state : int, optional
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    model : RandomForestClassifier
-        The trained random forest model.
-    metrics : dict
-        A dictionary of evaluation metrics on the validation set.
-    """
-    X = df[feature_cols]
-    y = df[target_col]
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
-    model = RandomForestClassifier(n_estimators=200, random_state=random_state)
+    model = RandomForestClassifier(
+        n_estimators=300, max_depth=None, min_samples_leaf=2, n_jobs=-1, random_state=random_state
+    )
     model.fit(X_train, y_train)
+
     y_pred = model.predict(X_test)
     metrics = {
-        "accuracy": accuracy_score(y_test, y_pred),
-        "precision": precision_score(y_test, y_pred),
-        "recall": recall_score(y_test, y_pred),
-        "f1": f1_score(y_test, y_pred),
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_test, y_pred, zero_division=0)),
     }
     return model, metrics
 
-
-def simulate_trades(
-    df: pd.DataFrame,
-    model: RandomForestClassifier,
-    feature_cols: list[str],
-    horizon: int,
-) -> Dict[str, float]:
-    """Simulate a simple trading strategy based on model predictions.
-
-    For each row in the DataFrame (except the last `horizon` rows), the
-    model prediction determines whether to enter a long (predict=0) or short
-    (predict=1) trade.  The trade is closed `horizon` minutes later using
-    the close price at that time.  Profit is calculated as the difference
-    between entry and exit prices (long trades profit when exit > entry;
-    short trades profit when entry > exit).  No transaction costs are
-    considered.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame containing the features and a 'close' column.  It
-        should already include indicator columns and a 'target' column.
-    model : RandomForestClassifier
-        Trained classifier used to predict the direction.
-    feature_cols : list[str]
-        Feature column names used for prediction.
-    horizon : int
-        Number of minutes ahead to close the trade.
-
-    Returns
-    -------
-    Dict[str, float]
-        A dictionary containing total profit, average profit per trade,
-        and win rate (fraction of profitable trades).
+# -------------------------
+# ✅ 增量学习（最简单可用）
+# -------------------------
+def init_incremental_model() -> "Pipeline":
     """
-    profits = []
-    # We iterate up to len(df) - horizon to avoid indexing beyond the end
-    for i in range(len(df) - horizon):
-        row = df.iloc[i]
-        entry_price = row["close"]
-        features = row[feature_cols].values.reshape(1, -1)
-        prob = model.predict_proba(features)[0, 1]
-        pred = int(prob > 0.5)  # 1 => decline predicted, short trade; 0 => long
-        exit_price = df.iloc[i + horizon]["close"]
-        if pred == 1:
-            # Short trade: profit when price declines
-            profit = entry_price - exit_price
-        else:
-            # Long trade: profit when price increases
-            profit = exit_price - entry_price
-        profits.append(profit)
-    total_profit = float(np.sum(profits))
-    avg_profit = float(np.mean(profits)) if profits else 0.0
-    win_rate = float(np.sum([1 for p in profits if p > 0]) / len(profits)) if profits else 0.0
-    return {
-        "total_profit": total_profit,
-        "avg_profit": avg_profit,
-        "win_rate": win_rate,
-    }
-
-
-def predict_latest(
-    model: RandomForestClassifier, latest_row: pd.Series, feature_cols: list[str]
-) -> Tuple[int, float]:
-    """Predict the trend direction for the latest feature row.
-
-    Parameters
-    ----------
-    model : RandomForestClassifier
-        Trained random forest model.
-    latest_row : pd.Series
-        A single-row Series containing feature columns.
-    feature_cols : list[str]
-        List of feature column names to extract from `latest_row`.
-
-    Returns
-    -------
-    int
-        Predicted class label (1 if price expected to decline, 0 otherwise).
-    float
-        Estimated probability of the positive class (decline).
+    返回一个可 partial_fit 的流水线：StandardScaler + SGDClassifier(logistic)
     """
-    X_latest = latest_row[feature_cols].values.reshape(1, -1)
-    prob = model.predict_proba(X_latest)[0, 1]
-    pred = int(prob > 0.5)
-    return pred, prob
+    clf = SGDClassifier(loss="log_loss", learning_rate="optimal", alpha=1e-4, random_state=42)
+    pipe = make_pipeline(StandardScaler(with_mean=True, with_std=True), clf)
+    return pipe
+
+def partial_fit_step(model, X_chunk: np.ndarray, y_chunk: np.ndarray):
+    """
+    对模型执行一次增量更新。如果是第一次，需要传入 classes=[0,1]。
+    Pipeline 会把 partial_fit 递交给各步（StandardScaler、SGDClassifier）。
+    """
+    # 第一次需要 classes
+    needs_init = not hasattr(model, "classes_") and not hasattr(model[-1], "classes_")
+    if needs_init:
+        model.partial_fit(X_chunk, y_chunk, classes=np.array([0, 1], dtype=int))
+    else:
+        model.partial_fit(X_chunk, y_chunk)
+
+def predict_proba_safe(model, X: np.ndarray) -> np.ndarray:
+    """
+    取上涨(1)的概率；若模型不支持 predict_proba，退化为 decision_function 的sigmoid。
+    """
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)
+    import numpy as np
+    from scipy.special import expit
+    s = model.decision_function(X).reshape(-1, 1)
+    p1 = expit(s)
+    return np.hstack([1 - p1, p1])
