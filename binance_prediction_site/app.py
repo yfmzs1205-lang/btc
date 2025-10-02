@@ -1,11 +1,10 @@
 # binance_prediction_site/app.py
 from __future__ import annotations
-import pandas as pd
+import pickle
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import pickle
-import time
 
 from utils.data_utils import fetch_klines, prepare_target
 from utils.model import (
@@ -30,16 +29,15 @@ st.caption(
 # =========================
 def init_state():
     ss = st.session_state
-    ss.setdefault("balance", 100.0)           # 初始本金
-    ss.setdefault("open_orders", [])          # 未结算订单
-    ss.setdefault("order_history", [])        # 已结算订单
+    ss.setdefault("balance", 100.0)            # 初始本金
+    ss.setdefault("open_orders", [])           # 未结算订单
+    ss.setdefault("order_history", [])         # 已结算订单
     ss.setdefault("order_id", 1)
     ss.setdefault("latest_price", None)
     ss.setdefault("latest_ts", None)
-    ss.setdefault("df_cache", None)           # 数据缓存（避免免费层频繁请求）
-    # 增量学习模型与训练进度
-    ss.setdefault("inc_model", None)
-    ss.setdefault("last_train_index", 0)
+    ss.setdefault("df_cache", None)            # 数据缓存（避免免费层频繁请求）
+    ss.setdefault("inc_model", None)           # 增量学习模型
+    ss.setdefault("last_train_index", 0)       # 已增量训练到的索引
 
 init_state()
 
@@ -98,7 +96,8 @@ df_raw = get_data(symbol_choice, limit=600)
 if not df_raw.empty:
     last_row = df_raw.iloc[-1]
     st.session_state.latest_price = float(last_row["close"])
-    st.session_state.latest_ts = pd.to_datetime(last_row["timestamp"]).tz_convert("UTC")
+    # data_utils 里 timestamp 是 UTC
+    st.session_state.latest_ts = pd.to_datetime(last_row["timestamp"])
     c1, c2 = st.columns(2)
     c1.metric("Latest price", f"{st.session_state.latest_price:.2f} {symbol_choice[-4:]}")
     c2.write(f"UTC time: **{st.session_state.latest_ts}**")
@@ -121,15 +120,15 @@ if use_indicators:
 df_label[feature_cols] = df_label[feature_cols].astype(float)
 
 # =========================
-# Training (batch + optional incremental)
+# Training (batch + optional incremental) —— 已含 NaN/Inf 清洗
 # =========================
 st.markdown("### Training")
-tc1, tc2, tc3 = st.columns([1,1,2])
+tc1, tc2, tc3 = st.columns([1, 1, 2])
 use_incremental = tc1.checkbox("Enable incremental learning (partial_fit)", value=True)
 save_btn = tc2.button("💾 Save model")
 load_file = tc3.file_uploader("Load a saved model (.pkl)", type=["pkl"], label_visibility="collapsed")
 
-# Load uploaded model
+# 载入用户上传的模型
 if load_file is not None:
     try:
         st.session_state.inc_model = pickle.load(load_file)
@@ -137,28 +136,41 @@ if load_file is not None:
     except Exception as e:
         st.error(f"Load failed: {e}")
 
-# Init incremental model if enabled
+# —— 核心清洗：把特征与标签一起做 ffill/bfill，剔除残留缺失
+use_cols = feature_cols + ["target"]
+tmp = df_label[use_cols].replace([np.inf, -np.inf], np.nan)
+tmp = tmp.fillna(method="ffill").fillna(method="bfill")
+tmp = tmp.dropna()
+# 对齐到原表（保留 timestamp 等列）
+train_df = df_label.loc[tmp.index].copy()
+train_df[use_cols] = tmp.astype(float)
+
+if len(train_df) < 50:
+    st.error("Not enough clean samples to train. Try disabling indicators or wait for more data.")
+    st.stop()
+
+# 初始化增量模型
 if use_incremental and st.session_state.inc_model is None:
     st.session_state.inc_model = init_incremental_model()
     st.session_state.last_train_index = 0
 
-# Baseline batch model for reference metrics
+# 批量基准模型（用于参考指标）
 with st.spinner("Training baseline model (batch) and evaluating..."):
-    batch_model, metrics = train_classifier(df_label, feature_cols=feature_cols, target_col="target")
+    batch_model, metrics = train_classifier(train_df, feature_cols=feature_cols, target_col="target")
 
-# Incremental update on new chunk
+# 增量更新：仅对“新样本”partial_fit
 if use_incremental:
-    start_idx = st.session_state.get("last_train_index", 0)
-    end_idx = len(df_label) - 2   # 留最后一条做推理
+    start_idx = int(st.session_state.get("last_train_index", 0))
+    end_idx = len(train_df) - 2  # 留最后一条用于推理
     if end_idx > start_idx:
-        X_chunk = df_label[feature_cols].iloc[start_idx:end_idx].values
-        y_chunk = df_label["target"].iloc[start_idx:end_idx].values.astype(int)
+        X_chunk = train_df[feature_cols].iloc[start_idx:end_idx].values
+        y_chunk = train_df["target"].iloc[start_idx:end_idx].values.astype(int)
         partial_fit_step(st.session_state.inc_model, X_chunk, y_chunk)
         st.session_state.last_train_index = end_idx
 
-    # Simple rolling evaluation
-    X_eval = df_label[feature_cols].iloc[-200:].values
-    y_eval = df_label["target"].iloc[-200:].values.astype(int)
+    # 简单滚动评估
+    X_eval = train_df[feature_cols].iloc[-200:].values
+    y_eval = train_df["target"].iloc[-200:].values.astype(int)
     p = predict_proba_safe(st.session_state.inc_model, X_eval)[:, 1]
     y_pred = (p >= 0.5).astype(int)
     from sklearn.metrics import accuracy_score, precision_score, recall_score
@@ -171,7 +183,7 @@ if use_incremental:
 else:
     current_model = batch_model
 
-# Save model
+# 保存模型
 if save_btn:
     try:
         buf = pickle.dumps(current_model)
@@ -179,7 +191,7 @@ if save_btn:
     except Exception as e:
         st.error(f"Save failed: {e}")
 
-# Show metrics
+# 展示指标
 m1, m2, m3 = st.columns(3)
 m1.metric("Accuracy", f"{metrics.get('accuracy', 0)*100:.2f}%")
 m2.metric("Precision", f"{metrics.get('precision', 0)*100:.2f}%")
@@ -199,8 +211,8 @@ def predict_direction_latest(model, df: pd.DataFrame) -> tuple[int, float]:
     conf = float(max(prob_up, 1 - prob_up))
     return pred, conf
 
-pred, conf = predict_direction_latest(current_model, df_label)
-st.subheader(f"Prediction for the next {10 if horizon==10 else 30} minutes")
+pred, conf = predict_direction_latest(current_model, train_df)
+st.subheader(f"Prediction for the next {horizon} minutes")
 st.info(
     f"📌 Price likely to **{'rise' if pred==1 else 'fall'}** with confidence **{conf*100:.2f}%** "
     f"for `{symbol_choice}` in `{horizon}m` horizon."
@@ -239,16 +251,17 @@ def settle_orders(current_index: int, df: pd.DataFrame):
                 st.session_state.balance += pnl
             od["pnl"] = pnl
             od["exit_price"] = float(settle_close)
-            od["exit_time"] = str(df.iloc[od["settle_index"]]["timestamp"]) if "timestamp" in df.columns else "N/A"
+            od["exit_time"] = str(df.iloc[od["settle_index"]].get("timestamp", "N/A"))
             od["status"] = "WIN" if win else "LOSS"
             st.session_state.order_history.append(od)
             to_close.append(od)
     for od in to_close:
         st.session_state.open_orders.remove(od)
 
-cur_idx = len(df_label) - 1
+# 使用“干净训练集”的索引做结算（避免 NaN 尾巴）
+cur_idx = len(train_df) - 1
 if cur_idx >= 0:
-    settle_orders(cur_idx, df_label)
+    settle_orders(cur_idx, train_df)
 
 cA, cB, cC, cD = st.columns([1, 1, 1, 2])
 side = cA.radio("Direction", ["LONG", "SHORT"], horizontal=True)
@@ -263,16 +276,16 @@ def place_order(side: str, amount: float):
     if amount > st.session_state.balance:
         st.error("Insufficient balance.")
         return
-    entry_index = len(df_label) - 1
+    entry_index = len(train_df) - 1
     order = {
         "id": st.session_state.order_id,
         "symbol": symbol_choice,
         "side": side,
         "amount": float(amount),
-        "entry_price": float(df_label.iloc[entry_index]["close"]),
-        "entry_time": str(df_label.iloc[entry_index]["timestamp"]) if "timestamp" in df_label.columns else "N/A",
+        "entry_price": float(train_df.iloc[entry_index]["close"]),
+        "entry_time": str(train_df.iloc[entry_index].get("timestamp", "N/A")),
         "entry_index": entry_index,
-        "settle_index": entry_index + horizon,
+        "settle_index": entry_index + horizon,   # 1m K线 ⇒ horizon 分钟后
         "horizon_min": horizon,
         "status": "OPEN",
     }
@@ -302,5 +315,7 @@ if not hist_df.empty:
     hist_df = hist_df[cols]
 st.dataframe(hist_df, use_container_width=True, height=220)
 
-st.caption("Note: Model retrains on each refresh. Incremental learning will keep adapting during the session. "
-           "Use Save/Load to persist a model snapshot.")
+st.caption(
+    "Note: Model retrains on each refresh. Incremental learning adapts during the session. "
+    "Use Save/Load to persist a model snapshot."
+)
