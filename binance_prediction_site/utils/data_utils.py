@@ -9,7 +9,7 @@ BINANCE_BASES: List[str] = [
     "https://api2.binance.com",
     "https://api3.binance.com",
     "https://api-gcp.binance.com",
-    # 官方公开镜像，常用于被墙/合规限制场景
+    # 官方公开镜像
     "https://data-api.binance.vision",
 ]
 
@@ -43,10 +43,8 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 600
 
 def prepare_target(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     """
-    根据未来收盘价与当前收盘价的比较，生成二分类目标:
-      y = 1 (上涨) / 0 (下跌或持平)
-    会新增两列：future_close, y；并丢弃因 shift 产生的尾部缺失行。
-    返回：带 y 的 DataFrame（后续特征工程从这里继续）。
+    生成二分类目标 y：未来horizon步收盘价是否高于当前收盘价。
+    新增列：future_close, y；丢弃尾部缺失行。
     """
     out = df.copy()
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
@@ -54,4 +52,3 @@ def prepare_target(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     out["y"] = (out["future_close"] > out["close"]).astype("Int64")
     out = out.dropna(subset=["future_close", "y"])
     return out
-replace data_utils with multi-endpoint + prepare_target
