@@ -1,54 +1,57 @@
 # binance_prediction_site/app.py
 from __future__ import annotations
-import time
 import pandas as pd
 import numpy as np
 import streamlit as st
+import plotly.graph_objects as go
+import pickle
+import time
+
 from utils.data_utils import fetch_klines, prepare_target
-from utils.model import train_classifier
-
-# -----------------------------
-# Streamlit 基础设置
-# -----------------------------
-st.set_page_config(page_title="Binance 10/30-Minute Trend Predictor (Education Only)",
-                   layout="wide")
-
-st.title("📈 Binance 10/30-Minute Trend Predictor (Education Only)")
-st.caption(
-    "This tool fetches recent minute-level data from Binance and trains a simple machine learning model "
-    "on the fly to forecast whether the price of Bitcoin (BTC) or Ethereum (ETH) is likely to decline after "
-    "a selected time horizon. It is intended for learning and demonstration purposes only."
+from utils.model import (
+    train_classifier,
+    init_incremental_model,
+    partial_fit_step,
+    predict_proba_safe,
 )
 
-# -----------------------------
-# Session State：资金与订单
-# -----------------------------
+# =========================
+# Page setup
+# =========================
+st.set_page_config(page_title="Binance 10/30-Minute Trend Predictor (Education Only)", layout="wide")
+st.title("📈 Binance 10/30-Minute Trend Predictor (Education Only)")
+st.caption(
+    "Demo only. Fetches recent 1-minute klines and trains a lightweight model. "
+    "Includes paper trading. No real trading. Educational use only."
+)
+
+# =========================
+# Session state
+# =========================
 def init_state():
-    if "balance" not in st.session_state:
-        st.session_state.balance = 100.0   # 初始本金 100 USDT
-    if "open_orders" not in st.session_state:
-        st.session_state.open_orders = []   # 未结算订单
-    if "order_history" not in st.session_state:
-        st.session_state.order_history = [] # 已结算订单
-    if "order_id" not in st.session_state:
-        st.session_state.order_id = 1
-    if "latest_price" not in st.session_state:
-        st.session_state.latest_price = None
-        st.session_state.latest_ts = None
-    if "df_cache" not in st.session_state:
-        st.session_state.df_cache = None
+    ss = st.session_state
+    ss.setdefault("balance", 100.0)           # 初始本金
+    ss.setdefault("open_orders", [])          # 未结算订单
+    ss.setdefault("order_history", [])        # 已结算订单
+    ss.setdefault("order_id", 1)
+    ss.setdefault("latest_price", None)
+    ss.setdefault("latest_ts", None)
+    ss.setdefault("df_cache", None)           # 数据缓存（避免免费层频繁请求）
+    # 增量学习模型与训练进度
+    ss.setdefault("inc_model", None)
+    ss.setdefault("last_train_index", 0)
 
 init_state()
 
-# -----------------------------
-# 工具：技术指标（轻量实现，避免依赖冲突）
-# -----------------------------
+# =========================
+# Simple technical indicators
+# =========================
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(gain).rolling(period).mean()
-    roll_down = pd.Series(loss).rolling(period).mean()
+    roll_up = pd.Series(gain, index=series.index).rolling(period).mean()
+    roll_down = pd.Series(loss, index=series.index).rolling(period).mean()
     rs = roll_up / (roll_down + 1e-9)
     return 100.0 - (100.0 / (1.0 + rs))
 
@@ -68,25 +71,22 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["macd_signal"] = s
     return out
 
-# -----------------------------
-# 左侧参数区
-# -----------------------------
+# =========================
+# Sidebar controls
+# =========================
 with st.sidebar:
     st.header("Configuration")
     symbol_choice = st.selectbox("Select trading pair", ["BTCUSDT", "ETHUSDT"])
     horizon_choice = st.radio("Prediction horizon", ["10 minutes", "30 minutes"])
     horizon = 10 if horizon_choice.startswith("10") else 30
-    use_indicators = st.checkbox("Add technical indicators (SMA/RSI/MACD) to improve accuracy", value=True)
-
-    # 实时刷新按钮
+    use_indicators = st.checkbox("Add technical indicators (SMA / RSI / MACD)", value=True)
     if st.button("🔄 Refresh latest price & retrain"):
-        st.session_state.df_cache = None  # 强制重新取数
+        st.session_state.df_cache = None   # 强制重拉数据（并触发重训）
 
-# -----------------------------
-# 取数 + 实时价格
-# -----------------------------
+# =========================
+# Data
+# =========================
 def get_data(symbol: str, limit: int = 600) -> pd.DataFrame:
-    # 使用缓存，避免免费层频繁请求
     if st.session_state.df_cache is None:
         df = fetch_klines(symbol=symbol, interval="1m", limit=limit)
         st.session_state.df_cache = df
@@ -94,168 +94,199 @@ def get_data(symbol: str, limit: int = 600) -> pd.DataFrame:
 
 df_raw = get_data(symbol_choice, limit=600)
 
-# 最新价格展示
+# Latest price
 if not df_raw.empty:
     last_row = df_raw.iloc[-1]
     st.session_state.latest_price = float(last_row["close"])
     st.session_state.latest_ts = pd.to_datetime(last_row["timestamp"]).tz_convert("UTC")
-    colp1, colp2 = st.columns(2)
-    colp1.metric("Latest price", f"{st.session_state.latest_price:.2f} {symbol_choice[-4:]}")
-    colp2.write(f"UTC time: **{st.session_state.latest_ts}**")
+    c1, c2 = st.columns(2)
+    c1.metric("Latest price", f"{st.session_state.latest_price:.2f} {symbol_choice[-4:]}")
+    c2.write(f"UTC time: **{st.session_state.latest_ts}**")
 
-# -----------------------------
-# 训练集构造 + 训练
-# -----------------------------
-# 添加指标（可选）
+# =========================
+# Features & label
+# =========================
 df_work = add_indicators(df_raw) if use_indicators else df_raw.copy()
-
-# 准备标签
 df_label = prepare_target(df_work, horizon=horizon, target_col="target")
 
-# 简单特征列：价格变化 +（可选）指标
+# 基础特征
 feature_cols = ["close"]
-# 加入衍生变化率
-df_label["ret_1"] = df_label["close"].pct_change().fillna(0)
+df_label["ret_1"] = df_label["close"].pct_change().fillna(0.0)
 feature_cols.append("ret_1")
-
 if use_indicators:
     for c in ["sma_14", "rsi_14", "macd", "macd_signal"]:
         if c in df_label.columns:
             df_label[c] = df_label[c].fillna(method="ffill")
             feature_cols.append(c)
-
-# 安全过滤数值
 df_label[feature_cols] = df_label[feature_cols].astype(float)
 
-# 训练与评估
-with st.spinner("Training model and evaluating performance..."):
-    model, metrics = train_classifier(df_label, feature_cols=feature_cols, target_col="target")
+# =========================
+# Training (batch + optional incremental)
+# =========================
+st.markdown("### Training")
+tc1, tc2, tc3 = st.columns([1,1,2])
+use_incremental = tc1.checkbox("Enable incremental learning (partial_fit)", value=True)
+save_btn = tc2.button("💾 Save model")
+load_file = tc3.file_uploader("Load a saved model (.pkl)", type=["pkl"], label_visibility="collapsed")
 
-# 展示指标
-c1, c2, c3 = st.columns(3)
-c1.metric("Accuracy", f"{metrics.get('accuracy', 0)*100:.2f}%")
-c2.metric("Precision", f"{metrics.get('precision', 0)*100:.2f}%")
-c3.metric("Recall", f"{metrics.get('recall', 0)*100:.2f}%")
+# Load uploaded model
+if load_file is not None:
+    try:
+        st.session_state.inc_model = pickle.load(load_file)
+        st.success("Model loaded.")
+    except Exception as e:
+        st.error(f"Load failed: {e}")
 
-# -----------------------------
-# 推理：未来方向 & 置信度
-# -----------------------------
+# Init incremental model if enabled
+if use_incremental and st.session_state.inc_model is None:
+    st.session_state.inc_model = init_incremental_model()
+    st.session_state.last_train_index = 0
+
+# Baseline batch model for reference metrics
+with st.spinner("Training baseline model (batch) and evaluating..."):
+    batch_model, metrics = train_classifier(df_label, feature_cols=feature_cols, target_col="target")
+
+# Incremental update on new chunk
+if use_incremental:
+    start_idx = st.session_state.get("last_train_index", 0)
+    end_idx = len(df_label) - 2   # 留最后一条做推理
+    if end_idx > start_idx:
+        X_chunk = df_label[feature_cols].iloc[start_idx:end_idx].values
+        y_chunk = df_label["target"].iloc[start_idx:end_idx].values.astype(int)
+        partial_fit_step(st.session_state.inc_model, X_chunk, y_chunk)
+        st.session_state.last_train_index = end_idx
+
+    # Simple rolling evaluation
+    X_eval = df_label[feature_cols].iloc[-200:].values
+    y_eval = df_label["target"].iloc[-200:].values.astype(int)
+    p = predict_proba_safe(st.session_state.inc_model, X_eval)[:, 1]
+    y_pred = (p >= 0.5).astype(int)
+    from sklearn.metrics import accuracy_score, precision_score, recall_score
+    metrics = {
+        "accuracy": float(accuracy_score(y_eval, y_pred)),
+        "precision": float(precision_score(y_eval, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_eval, y_pred, zero_division=0)),
+    }
+    current_model = st.session_state.inc_model
+else:
+    current_model = batch_model
+
+# Save model
+if save_btn:
+    try:
+        buf = pickle.dumps(current_model)
+        st.download_button("Download model.pkl", data=buf, file_name="model.pkl", mime="application/octet-stream")
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+
+# Show metrics
+m1, m2, m3 = st.columns(3)
+m1.metric("Accuracy", f"{metrics.get('accuracy', 0)*100:.2f}%")
+m2.metric("Precision", f"{metrics.get('precision', 0)*100:.2f}%")
+m3.metric("Recall", f"{metrics.get('recall', 0)*100:.2f}%")
+
+# =========================
+# Inference
+# =========================
 def predict_direction_latest(model, df: pd.DataFrame) -> tuple[int, float]:
     row = pd.DataFrame([df[feature_cols].iloc[-1].values], columns=feature_cols)
-    prob = model.predict_proba(row)[0, 1]  # 预测“上涨”的概率
-    pred = int(prob >= 0.5)
-    conf = float(max(prob, 1 - prob))
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(row)[0]
+    else:
+        proba = predict_proba_safe(model, row.values)[0]
+    prob_up = float(proba[1])
+    pred = int(prob_up >= 0.5)
+    conf = float(max(prob_up, 1 - prob_up))
     return pred, conf
 
-pred, conf = predict_direction_latest(model, df_label)
-msg_dir = "increase or stay the same" if pred == 1 else "decline"
-st.subheader(f"Prediction for the next {horizon} minutes")
+pred, conf = predict_direction_latest(current_model, df_label)
+st.subheader(f"Prediction for the next {10 if horizon==10 else 30} minutes")
 st.info(
-    f"📌 Price likely to **{('rise' if pred==1 else 'fall')}** with confidence **{conf*100:.2f}%**. "
-    f"The model suggests that the `{symbol_choice}` price in `{horizon_choice}` will "
-    f"`{'increase or stay the same' if pred==1 else 'decline'}`."
+    f"📌 Price likely to **{'rise' if pred==1 else 'fall'}** with confidence **{conf*100:.2f}%** "
+    f"for `{symbol_choice}` in `{horizon}m` horizon."
 )
+st.warning("💡 Consider avoiding a long position." if pred == 0 else "💡 Consider avoiding a short position.")
 
-st.warning("💡 Suggestion: Consider selling or avoiding a long position." if pred == 0
-           else "💡 Suggestion: Consider avoiding a short position.")
-
-# -----------------------------
-# 最近价格图
-# -----------------------------
-import plotly.graph_objects as go
+# =========================
+# Recent price chart
+# =========================
 plot_df = df_raw.tail(200)
 fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=plot_df["timestamp"], y=plot_df["close"],
-    mode="lines", name="Close Price"
-))
+fig.add_trace(go.Scatter(x=plot_df["timestamp"], y=plot_df["close"], mode="lines", name="Close"))
 fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
 st.subheader("Recent Price Chart (last 200 minutes)")
 st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# 模拟交易
-# -----------------------------
+# =========================
+# Paper trading
+# =========================
 st.subheader("💸 Paper Trading (Simulation)")
-st.caption("Initial balance: 100 USDT. Order size: min 5U, max 125U. Payout: 80% on correct direction; loss = stake on incorrect.")
+st.caption("Initial balance 100 USDT. Min order 5U, max 125U. Payout +80% on correct direction; "
+           "lose stake on wrong direction. Orders settle after selected horizon.")
 
-# 结算到期订单：按照 horizon 的步数结算（基于 1m K线）
 def settle_orders(current_index: int, df: pd.DataFrame):
     to_close = []
     for od in st.session_state.open_orders:
         if current_index >= od["settle_index"]:
             entry_close = df.iloc[od["entry_index"]]["close"]
             settle_close = df.iloc[od["settle_index"]]["close"]
-            # 方向判断
             win = (settle_close > entry_close) if od["side"] == "LONG" else (settle_close < entry_close)
             if win:
-                pnl = round(od["amount"] * 0.8, 2)  # 80% 赔率
+                pnl = round(od["amount"] * 0.8, 2)  # +80%
                 st.session_state.balance += pnl
             else:
-                pnl = round(-od["amount"], 2)
-                st.session_state.balance += pnl  # 直接扣除下注额（负数）
+                pnl = round(-od["amount"], 2)       # -100%
+                st.session_state.balance += pnl
             od["pnl"] = pnl
             od["exit_price"] = float(settle_close)
+            od["exit_time"] = str(df.iloc[od["settle_index"]]["timestamp"]) if "timestamp" in df.columns else "N/A"
             od["status"] = "WIN" if win else "LOSS"
-            od["exit_time"] = str(df.iloc[od["settle_index"]]["timestamp"])
             st.session_state.order_history.append(od)
             to_close.append(od)
-
-    # 从未结列表移除
     for od in to_close:
         st.session_state.open_orders.remove(od)
 
-# 当前索引（最后一根K线）
 cur_idx = len(df_label) - 1
 if cur_idx >= 0:
-    # 结算可能到期的订单
     settle_orders(cur_idx, df_label)
 
-# 下单控件
-colA, colB, colC, colD = st.columns([1, 1, 1, 2])
-side = colA.radio("Direction", ["LONG", "SHORT"], horizontal=True)
-amount = colB.number_input("Order amount (USDT)", min_value=5, max_value=125, step=5, value=10)
-colC.metric("Balance (USDT)", f"{st.session_state.balance:.2f}")
-place = colD.button("✅ Place order now")
+cA, cB, cC, cD = st.columns([1, 1, 1, 2])
+side = cA.radio("Direction", ["LONG", "SHORT"], horizontal=True)
+amount = cB.number_input("Order amount (USDT)", min_value=5, max_value=125, step=5, value=10)
+cC.metric("Balance (USDT)", f"{st.session_state.balance:.2f}")
+place = cD.button("✅ Place order now")
 
 def place_order(side: str, amount: float):
-    # 资金检查
     if amount < 5 or amount > 125:
         st.error("Order size must be between 5 and 125 USDT.")
         return
     if amount > st.session_state.balance:
         st.error("Insufficient balance.")
         return
-    # 记录订单
     entry_index = len(df_label) - 1
-    settle_index = entry_index + horizon
     order = {
         "id": st.session_state.order_id,
         "symbol": symbol_choice,
         "side": side,
         "amount": float(amount),
         "entry_price": float(df_label.iloc[entry_index]["close"]),
-        "entry_time": str(df_label.iloc[entry_index]["timestamp"])
-                        if "timestamp" in df_label.columns else "N/A",
+        "entry_time": str(df_label.iloc[entry_index]["timestamp"]) if "timestamp" in df_label.columns else "N/A",
         "entry_index": entry_index,
-        "settle_index": settle_index,
+        "settle_index": entry_index + horizon,
         "horizon_min": horizon,
         "status": "OPEN",
     }
-    # 预先扣除成本（把本金锁定）
-    st.session_state.balance -= amount
+    st.session_state.balance -= amount           # 锁定本金
     st.session_state.open_orders.append(order)
     st.session_state.order_id += 1
-    st.success(f"Order #{order['id']} placed: {side} {amount} USDT at {order['entry_price']:.2f}")
+    st.success(f"Order #{order['id']} placed: {side} {amount} USDT @ {order['entry_price']:.2f}")
 
 if place:
     place_order(side, amount)
 
-# 展示订单表
 def _fmt_table(rows):
     if not rows:
-        return pd.DataFrame([], columns=["id","symbol","side","amount","entry_price",
-                                         "entry_time","status"])
+        return pd.DataFrame([], columns=["id","symbol","side","amount","entry_price","entry_time","status"])
     return pd.DataFrame(rows)
 
 st.markdown("**Open orders**")
@@ -264,17 +295,12 @@ st.dataframe(_fmt_table(st.session_state.open_orders), use_container_width=True,
 st.markdown("**Order history**")
 hist_df = _fmt_table(st.session_state.order_history)
 if not hist_df.empty:
-    cols = ["id","symbol","side","amount","entry_price","exit_price","pnl",
-            "entry_time","exit_time","status"]
+    cols = ["id","symbol","side","amount","entry_price","exit_price","pnl","entry_time","exit_time","status"]
     for c in cols:
         if c not in hist_df.columns:
             hist_df[c] = np.nan
     hist_df = hist_df[cols]
 st.dataframe(hist_df, use_container_width=True, height=220)
 
-# 说明
-st.caption(
-    "Notes: This is a paper-trading simulator. Orders settle after the selected horizon "
-    "using close-to-close direction. Payout is +80% of stake on correct direction; "
-    "otherwise you lose the stake. The model is retrained each refresh on the latest data."
-)
+st.caption("Note: Model retrains on each refresh. Incremental learning will keep adapting during the session. "
+           "Use Save/Load to persist a model snapshot.")
