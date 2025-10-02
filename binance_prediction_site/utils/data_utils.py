@@ -18,7 +18,7 @@ _REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 600) -> pd.DataFrame:
     """
-    拉取K线，自动在多个域名之间切换；返回包含 open/high/low/close/volume 等列的 DataFrame。
+    拉取K线，自动在多个域名之间切换；返回包含 open/high/low/close/volume/timestamp 等列的 DataFrame。
     """
     last_err = None
     for base in BINANCE_BASES:
@@ -32,9 +32,17 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 600
                     "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
                 ]
                 df = pd.DataFrame(k, columns=cols)
-                # 只转常用列的类型
+
+                # 数值列转型
                 for c in ("open", "high", "low", "close", "volume"):
                     df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                # ✅ 新增用于画图/展示的统一时间列
+                # Binance 返回的 open_time 单位是毫秒
+                df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+
+                # 按时间排序，避免乱序
+                df = df.sort_values("timestamp").reset_index(drop=True)
                 return df
             else:
                 # 451/429/5xx → 尝试下一个域名
