@@ -54,3 +54,4 @@ def prepare_target(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     out["y"] = (out["future_close"] > out["close"]).astype("Int64")
     out = out.dropna(subset=["future_close", "y"])
     return out
+replace data_utils with multi-endpoint + prepare_target
