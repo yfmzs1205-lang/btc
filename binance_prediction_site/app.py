@@ -1,5 +1,6 @@
 # binance_prediction_site/app.py
 from __future__ import annotations
+import time
 import pickle
 import numpy as np
 import pandas as pd
@@ -38,6 +39,8 @@ def init_state():
     ss.setdefault("df_cache", None)            # 数据缓存（避免免费层频繁请求）
     ss.setdefault("inc_model", None)           # 增量学习模型
     ss.setdefault("last_train_index", 0)       # 已增量训练到的索引
+    ss.setdefault("best_thr", 0.5)             # 调优得到的决策阈值
+    ss.setdefault("_last_auto_ts", 0.0)        # 自动刷新时间戳
 
 init_state()
 
@@ -78,7 +81,27 @@ with st.sidebar:
     horizon_choice = st.radio("Prediction horizon", ["10 minutes", "30 minutes"])
     horizon = 10 if horizon_choice.startswith("10") else 30
     use_indicators = st.checkbox("Add technical indicators (SMA / RSI / MACD)", value=True)
-    if st.button("🔄 Refresh latest price & retrain"):
+
+    st.divider()
+    st.subheader("Label & decision")
+    # 标签噪声阈值：只有涨幅 > τ 才算上涨
+    label_tau_bp = st.slider("Label threshold τ (basis points)", 0, 50, 10, step=1,
+                             help="Only count as 'up' if future return > τ. 10bp = 0.1%.")
+    label_tau = label_tau_bp / 10000.0
+
+    # 观望阈值：概率在 [1-a, a] 区间内视为低置信，建议观望
+    abstain_threshold = st.slider("No-trade band (a)", 0.50, 0.70, 0.55, 0.01,
+                                  help="Require probability ≥ a to long, or ≤ (1-a) to short.")
+
+    # 强信号提醒阈值
+    alert_threshold = st.slider("Strong-signal alert threshold", 0.60, 0.90, 0.75, 0.01,
+                                help="P(up) ≥ t ⇒ STRONG LONG; P(up) ≤ 1-t ⇒ STRONG SHORT")
+
+    st.divider()
+    st.subheader("Refresh")
+    auto_refresh = st.checkbox("Auto-refresh", value=True)
+    refresh_sec = st.slider("Interval (seconds)", 5, 120, 30, 5)
+    if st.button("🔄 Refresh now"):
         st.session_state.df_cache = None   # 强制重拉数据（并触发重训）
 
 # =========================
@@ -96,7 +119,6 @@ df_raw = get_data(symbol_choice, limit=600)
 if not df_raw.empty:
     last_row = df_raw.iloc[-1]
     st.session_state.latest_price = float(last_row["close"])
-    # data_utils 里 timestamp 是 UTC
     st.session_state.latest_ts = pd.to_datetime(last_row["timestamp"])
     c1, c2 = st.columns(2)
     c1.metric("Latest price", f"{st.session_state.latest_price:.2f} {symbol_choice[-4:]}")
@@ -108,19 +130,29 @@ if not df_raw.empty:
 df_work = add_indicators(df_raw) if use_indicators else df_raw.copy()
 df_label = prepare_target(df_work, horizon=horizon, target_col="target")
 
-# 基础特征
+# —— 用阈值 τ 重写 target（抑制微小噪声）
+ret = df_work["close"].shift(-horizon) / df_work["close"] - 1.0
+df_label["target"] = (ret > label_tau).astype(int)
+
+# 基础与新增特征
 feature_cols = ["close"]
 df_label["ret_1"] = df_label["close"].pct_change().fillna(0.0)
-feature_cols.append("ret_1")
+df_label["ret_3"] = df_label["close"].pct_change(3).fillna(0.0)
+df_label["std_15"] = df_label["close"].rolling(15).std()
+pos_num = (df_label["close"] - df_label["close"].rolling(20).min())
+pos_den = (df_label["close"].rolling(20).max() - df_label["close"].rolling(20).min() + 1e-9)
+df_label["pos_20"] = (pos_num / pos_den).clip(0, 1)
+
+feature_cols += ["ret_1", "ret_3", "std_15", "pos_20"]
+
 if use_indicators:
     for c in ["sma_14", "rsi_14", "macd", "macd_signal"]:
         if c in df_label.columns:
-            df_label[c] = df_label[c].fillna(method="ffill")
+            df_label[c] = df_label[c].astype(float)
             feature_cols.append(c)
-df_label[feature_cols] = df_label[feature_cols].astype(float)
 
 # =========================
-# Training (batch + optional incremental) —— 已含 NaN/Inf 清洗
+# Training (batch + optional incremental) —— 含 NaN/Inf 清洗 & 阈值调优
 # =========================
 st.markdown("### Training")
 tc1, tc2, tc3 = st.columns([1, 1, 2])
@@ -136,16 +168,14 @@ if load_file is not None:
     except Exception as e:
         st.error(f"Load failed: {e}")
 
-# —— 核心清洗：把特征与标签一起做 ffill/bfill，剔除残留缺失
+# —— 清洗：前后填充 + 去除残留缺失/无穷
 use_cols = feature_cols + ["target"]
 tmp = df_label[use_cols].replace([np.inf, -np.inf], np.nan)
-tmp = tmp.fillna(method="ffill").fillna(method="bfill")
-tmp = tmp.dropna()
-# 对齐到原表（保留 timestamp 等列）
+tmp = tmp.fillna(method="ffill").fillna(method="bfill").dropna()
 train_df = df_label.loc[tmp.index].copy()
 train_df[use_cols] = tmp.astype(float)
 
-if len(train_df) < 50:
+if len(train_df) < 80:
     st.error("Not enough clean samples to train. Try disabling indicators or wait for more data.")
     st.stop()
 
@@ -154,11 +184,12 @@ if use_incremental and st.session_state.inc_model is None:
     st.session_state.inc_model = init_incremental_model()
     st.session_state.last_train_index = 0
 
-# 批量基准模型（用于参考指标）
+# 批量基准模型（仅供参考指标）
 with st.spinner("Training baseline model (batch) and evaluating..."):
-    batch_model, metrics = train_classifier(train_df, feature_cols=feature_cols, target_col="target")
+    batch_model, base_metrics = train_classifier(train_df, feature_cols=feature_cols, target_col="target")
 
 # 增量更新：仅对“新样本”partial_fit
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 if use_incremental:
     start_idx = int(st.session_state.get("last_train_index", 0))
     end_idx = len(train_df) - 2  # 留最后一条用于推理
@@ -168,19 +199,45 @@ if use_incremental:
         partial_fit_step(st.session_state.inc_model, X_chunk, y_chunk)
         st.session_state.last_train_index = end_idx
 
-    # 简单滚动评估
-    X_eval = train_df[feature_cols].iloc[-200:].values
-    y_eval = train_df["target"].iloc[-200:].values.astype(int)
+    # 简单滚动评估 + 阈值调优（F1）
+    X_eval = train_df[feature_cols].iloc[-400:].values
+    y_eval = train_df["target"].iloc[-400:].values.astype(int)
     p = predict_proba_safe(st.session_state.inc_model, X_eval)[:, 1]
-    y_pred = (p >= 0.5).astype(int)
-    from sklearn.metrics import accuracy_score, precision_score, recall_score
+
+    best_thr, best_f1 = 0.5, -1.0
+    for thr in np.linspace(0.45, 0.65, 41):
+        y_hat = (p >= thr).astype(int)
+        f1 = f1_score(y_eval, y_hat, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = float(f1), float(thr)
+    st.session_state.best_thr = best_thr
+
+    y_pred = (p >= best_thr).astype(int)
     metrics = {
         "accuracy": float(accuracy_score(y_eval, y_pred)),
         "precision": float(precision_score(y_eval, y_pred, zero_division=0)),
         "recall": float(recall_score(y_eval, y_pred, zero_division=0)),
+        "f1": best_f1,
     }
     current_model = st.session_state.inc_model
 else:
+    X_eval = train_df[feature_cols].iloc[-400:].values
+    y_eval = train_df["target"].iloc[-400:].values.astype(int)
+    p = predict_proba_safe(batch_model, X_eval)[:, 1]
+    best_thr, best_f1 = 0.5, -1.0
+    for thr in np.linspace(0.45, 0.65, 41):
+        y_hat = (p >= thr).astype(int)
+        f1 = f1_score(y_eval, y_hat, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = float(f1), float(thr)
+    st.session_state.best_thr = best_thr
+    y_pred = (p >= best_thr).astype(int)
+    metrics = {
+        "accuracy": float(accuracy_score(y_eval, y_pred)),
+        "precision": float(precision_score(y_eval, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_eval, y_pred, zero_division=0)),
+        "f1": best_f1,
+    }
     current_model = batch_model
 
 # 保存模型
@@ -192,32 +249,59 @@ if save_btn:
         st.error(f"Save failed: {e}")
 
 # 展示指标
-m1, m2, m3 = st.columns(3)
+m1, m2, m3, m4 = st.columns(4)
 m1.metric("Accuracy", f"{metrics.get('accuracy', 0)*100:.2f}%")
 m2.metric("Precision", f"{metrics.get('precision', 0)*100:.2f}%")
 m3.metric("Recall", f"{metrics.get('recall', 0)*100:.2f}%")
+m4.metric("F1 (tuned)", f"{metrics.get('f1', 0)*100:.2f}%")
+st.caption(f"Auto-tuned threshold: **{st.session_state.best_thr:.3f}** | Label τ = **{label_tau_bp} bp** | No-trade band ≥ **{abstain_threshold:.2f}** | Alert ≥ **{alert_threshold:.2f}**")
 
 # =========================
-# Inference
+# Inference + Alerts
 # =========================
-def predict_direction_latest(model, df: pd.DataFrame) -> tuple[int, float]:
+def predict_direction_latest(model, df: pd.DataFrame, thr: float) -> tuple[int, float, float]:
     row = pd.DataFrame([df[feature_cols].iloc[-1].values], columns=feature_cols)
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(row)[0]
-    else:
-        proba = predict_proba_safe(model, row.values)[0]
+    proba = model.predict_proba(row)[0] if hasattr(model, "predict_proba") else predict_proba_safe(model, row.values)[0]
     prob_up = float(proba[1])
-    pred = int(prob_up >= 0.5)
-    conf = float(max(prob_up, 1 - prob_up))
-    return pred, conf
+    pred = int(prob_up >= thr)
+    # 置信度：与阈值的距离（0~0.5），再映射到 0~1 便于直觉
+    conf = float(2 * abs(prob_up - thr))
+    return pred, conf, prob_up
 
-pred, conf = predict_direction_latest(current_model, train_df)
+pred, conf, prob = predict_direction_latest(current_model, train_df, st.session_state.best_thr)
 st.subheader(f"Prediction for the next {horizon} minutes")
 st.info(
-    f"📌 Price likely to **{'rise' if pred==1 else 'fall'}** with confidence **{conf*100:.2f}%** "
-    f"for `{symbol_choice}` in `{horizon}m` horizon."
+    f"📌 P(up) = **{prob*100:.2f}%** | threshold = **{st.session_state.best_thr:.3f}** → "
+    f"**{'rise' if pred==1 else 'fall'}** (confidence {conf*100:.1f}%)."
 )
-st.warning("💡 Consider avoiding a long position." if pred == 0 else "💡 Consider avoiding a short position.")
+
+# 观望与强信号提醒
+abstain_low, abstain_high = (1 - abstain_threshold), abstain_threshold
+should_abstain = (prob > abstain_low) and (prob < abstain_high)
+
+# 强信号：高于 alert_threshold 或低于 1-alert_threshold
+strong_long = prob >= alert_threshold
+strong_short = prob <= (1 - alert_threshold)
+
+if should_abstain:
+    st.warning("⚠️ Low confidence: probability is in the no-trade band. Consider skipping this round.")
+else:
+    st.success("✅ Confidence passes no-trade band.")
+
+# 🔔 强信号提醒（视觉 Toast + 高亮）
+try:
+    if strong_long:
+        st.toast(f"🔔 STRONG LONG signal for {symbol_choice}: P(up)={prob*100:.2f}%", icon="✅")
+        st.success("🟢 Strong LONG signal detected.")
+    elif strong_short:
+        st.toast(f"🔔 STRONG SHORT signal for {symbol_choice}: P(up)={prob*100:.2f}%", icon="⚠️")
+        st.error("🔴 Strong SHORT signal detected.")
+except Exception:
+    # 旧版 Streamlit 没有 toast 就用普通提示
+    if strong_long:
+        st.success(f"🔔 STRONG LONG: P(up)={prob*100:.2f}%")
+    elif strong_short:
+        st.error(f"🔔 STRONG SHORT: P(up)={prob*100:.2f}%")
 
 # =========================
 # Recent price chart
@@ -258,7 +342,6 @@ def settle_orders(current_index: int, df: pd.DataFrame):
     for od in to_close:
         st.session_state.open_orders.remove(od)
 
-# 使用“干净训练集”的索引做结算（避免 NaN 尾巴）
 cur_idx = len(train_df) - 1
 if cur_idx >= 0:
     settle_orders(cur_idx, train_df)
@@ -270,6 +353,10 @@ cC.metric("Balance (USDT)", f"{st.session_state.balance:.2f}")
 place = cD.button("✅ Place order now")
 
 def place_order(side: str, amount: float):
+    # 观望带：禁止下单
+    if should_abstain:
+        st.error("Probability in no-trade band. Order blocked to avoid low-confidence trades.")
+        return
     if amount < 5 or amount > 125:
         st.error("Order size must be between 5 and 125 USDT.")
         return
@@ -316,6 +403,20 @@ if not hist_df.empty:
 st.dataframe(hist_df, use_container_width=True, height=220)
 
 st.caption(
-    "Note: Model retrains on each refresh. Incremental learning adapts during the session. "
-    "Use Save/Load to persist a model snapshot."
+    "Auto-refresh updates data and retrains. Strong-signal alerts trigger when P(up) crosses alert threshold. "
+    "Incremental learning adapts during the session. Use Save/Load to persist a model snapshot."
 )
+
+# =========================
+# Auto-refresh loop (simple)
+# =========================
+if auto_refresh:
+    # 控制刷新频率，避免过于频繁
+    now = time.time()
+    if now - st.session_state.get("_last_auto_ts", 0) >= refresh_sec:
+        # 清除缓存 → 重新拉取与训练
+        st.session_state.df_cache = None
+        st.session_state._last_auto_ts = now
+        # 轻量延时，避免连环触发
+        time.sleep(0.2)
+        st.experimental_rerun()
