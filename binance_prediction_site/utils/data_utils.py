@@ -13,6 +13,7 @@ BINANCE_BASES: List[str] = [
     "https://data-api.binance.vision",
 ]
 
+# 一些环境不带 UA 会被拦，统一加一个
 _REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 600) -> pd.DataFrame:
@@ -27,28 +28,31 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 600
             if r.status_code == 200:
                 k = r.json()
                 cols = [
-                    "open_time","open","high","low","close","volume",
-                    "close_time","qav","num_trades","taker_base","taker_quote","ignore"
+                    "open_time", "open", "high", "low", "close", "volume",
+                    "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
                 ]
                 df = pd.DataFrame(k, columns=cols)
-                for c in ("open","high","low","close","volume"):
+                # 只转常用列的类型
+                for c in ("open", "high", "low", "close", "volume"):
                     df[c] = pd.to_numeric(df[c], errors="coerce")
                 return df
             else:
+                # 451/429/5xx → 尝试下一个域名
                 last_err = RuntimeError(f"{r.status_code} from {base}")
         except Exception as e:
             last_err = e
             continue
     raise RuntimeError(f"All Binance endpoints failed. Last error: {last_err}")
 
-def prepare_target(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
+def prepare_target(df: pd.DataFrame, horizon: int = 10, target_col: str = "target") -> pd.DataFrame:
     """
-    生成二分类目标 y：未来horizon步收盘价是否高于当前收盘价。
-    新增列：future_close, y；丢弃尾部缺失行。
+    生成二分类目标 target：未来 horizon 步收盘价是否高于当前收盘价。
+    新增列：future_close, target；丢弃尾部缺失行。
     """
     out = df.copy()
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
     out["future_close"] = out["close"].shift(-horizon)
-    out["y"] = (out["future_close"] > out["close"]).astype("Int64")
-    out = out.dropna(subset=["future_close", "y"])
+    # target: 1=上涨, 0=不涨
+    out[target_col] = (out["future_close"] > out["close"]).astype(int)
+    out = out.dropna(subset=["future_close"])
     return out
